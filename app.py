@@ -1,11 +1,12 @@
 import streamlit as st
-import openai
+import anthropic
 import requests
 import os
 import io
 import time
+import tempfile
+import subprocess
 from groq import Groq
-from pydub import AudioSegment
 
 st.set_page_config(page_title="Ελληνική Μεταγραφή Ήχου", page_icon="🎙️", layout="wide", initial_sidebar_state="expanded")
 
@@ -32,7 +33,7 @@ hr { border-color: #2a2d38 !important; }
 """, unsafe_allow_html=True)
 
 ELEVENLABS_STT_URL = "https://api.elevenlabs.io/v1/speech-to-text"
-CHUNK_DURATION_MS  = 10 * 60 * 1000
+CHUNK_DURATION_S   = 10 * 60
 MAX_BYTES          = 24 * 1024 * 1024
 
 CLEANUP_SYSTEM = """Είσαι ειδικός διορθωτής ελληνικών κειμένων.
@@ -47,97 +48,117 @@ CLEANUP_SYSTEM = """Είσαι ειδικός διορθωτής ελληνικ�
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 🔑 API Keys")
-
-    el_key   = st.text_input("ElevenLabs API Key",  value=st.secrets.get("ELEVENLABS_API_KEY", ""), type="password", placeholder="xi-…")
-    groq_key = st.text_input("Groq API Key ⚡",      value=st.secrets.get("GROQ_API_KEY", ""),       type="password", placeholder="gsk_…")
-    oai_key  = st.text_input("OpenAI API Key",       value=st.secrets.get("OPENAI_API_KEY", ""),     type="password", placeholder="sk-…")
+    el_key      = st.text_input("ElevenLabs API Key",  value=st.secrets.get("ELEVENLABS_API_KEY", ""),  type="password", placeholder="xi-…")
+    groq_key    = st.text_input("Groq API Key ⚡",      value=st.secrets.get("GROQ_API_KEY", ""),        type="password", placeholder="gsk_…")
+    claude_key  = st.text_input("Anthropic (Claude) Key 🤖", value=st.secrets.get("ANTHROPIC_API_KEY", ""), type="password", placeholder="sk-ant-…")
 
     st.markdown("---")
     st.markdown("## 🧹 2ο Πέρασμα LLM")
-
-    # Use checkbox instead of toggle for wider Streamlit version compatibility
     do_cleanup = st.checkbox("Αυτόματη διόρθωση κειμένου", value=True)
 
-    # Always define these variables — avoids NameError if do_cleanup is False
-    cleanup_engine  = "Groq llama-3.3-70b ⚡"
-    custom_context  = ""
-
+    cleanup_engine = "Groq llama-3.3-70b ⚡"
+    custom_context = ""
     if do_cleanup:
         cleanup_engine = st.radio(
             "Engine διόρθωσης",
-            ["Groq llama-3.3-70b ⚡ (γρήγορο)", "OpenAI GPT-4o (ακριβέστερο)"],
+            ["Groq llama-3.3-70b ⚡ (γρήγορο)", "Claude Haiku 🤖 (ακριβέστερο)"],
         )
         custom_context = st.text_area(
             "Ειδικοί όροι (προαιρετικό)",
-            placeholder="π.χ. Στοά, Τέκτων, Σεβάσμιος Διδάσκαλος, Επόπτης...",
+            placeholder="π.χ. Στοά, Τέκτων, Σεβάσμιος Διδάσκαλος...",
             height=80,
         )
 
     st.markdown("---")
     st.markdown(
-        "<small style='font-family:\"IBM Plex Mono\",monospace;color:#555;'>"
-        "Fallback: ElevenLabs → Groq → OpenAI</small>",
+        "<small style='color:#555;font-family:\"IBM Plex Mono\",monospace;'>"
+        "Transcription: ElevenLabs → Groq Whisper<br>"
+        "Cleanup: Groq llama / Claude</small>",
         unsafe_allow_html=True,
     )
 
 # ── Audio helpers ──────────────────────────────────────────────────────────────
 
-def format_duration(ms):
-    s = ms // 1000
-    return f"{s // 60}m {s % 60}s"
+def format_duration(seconds):
+    m, s = divmod(int(seconds), 60)
+    return f"{m}m {s}s"
 
-def compress_to_mp3(audio, bitrate="64k"):
-    buf = io.BytesIO()
-    audio.export(buf, format="mp3", bitrate=bitrate)
-    return buf.getvalue()
+def get_audio_info(raw_bytes, filename):
+    ext = os.path.splitext(filename)[1].lower()
+    try:
+        if ext in ['.wav', '.flac', '.ogg']:
+            import soundfile as sf
+            with sf.SoundFile(io.BytesIO(raw_bytes)) as f:
+                return len(f) / f.samplerate, f.samplerate
+        else:
+            with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+                tmp.write(raw_bytes); tmp_path = tmp.name
+            try:
+                result = subprocess.run(
+                    ['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration',
+                     '-of', 'default=noprint_wrappers=1:nokey=1', tmp_path],
+                    capture_output=True, text=True, timeout=10)
+                return float(result.stdout.strip()), 48000
+            except Exception:
+                return len(raw_bytes) / (1024*1024) * 2.5 * 60, 48000
+            finally:
+                os.unlink(tmp_path)
+    except Exception:
+        return len(raw_bytes) / (1024*1024) * 2.5 * 60, 44100
 
-def split_audio(audio, chunk_ms=CHUNK_DURATION_MS):
-    return [audio[s:s+chunk_ms] for s in range(0, len(audio), chunk_ms)]
+def split_bytes_into_chunks(raw_bytes, filename, chunk_s=CHUNK_DURATION_S):
+    ext = os.path.splitext(filename)[1].lower()
+    try:
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp_in:
+            tmp_in.write(raw_bytes); tmp_in_path = tmp_in.name
+        result = subprocess.run(
+            ['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration',
+             '-of', 'default=noprint_wrappers=1:nokey=1', tmp_in_path],
+            capture_output=True, text=True, timeout=10)
+        total = float(result.stdout.strip())
+        n = max(1, int(total / chunk_s) + (1 if total % chunk_s else 0))
+        chunks = []
+        for i in range(n):
+            with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as tmp_out:
+                tmp_out_path = tmp_out.name
+            subprocess.run(['ffmpeg', '-y', '-ss', str(i*chunk_s), '-t', str(chunk_s),
+                '-i', tmp_in_path, '-q:a', '5', '-map', 'a', tmp_out_path],
+                capture_output=True, timeout=120)
+            with open(tmp_out_path, 'rb') as f:
+                data = f.read()
+            os.unlink(tmp_out_path)
+            if data: chunks.append(data)
+        os.unlink(tmp_in_path)
+        return chunks or [raw_bytes]
+    except Exception:
+        return [raw_bytes]
 
-def safe_mp3(chunk):
-    data = compress_to_mp3(chunk, "64k")
-    if len(data) > MAX_BYTES:
-        data = compress_to_mp3(chunk, "32k")
-    return data
+# ── Transcription ──────────────────────────────────────────────────────────────
 
-# ── Transcription backends ─────────────────────────────────────────────────────
-
-def transcribe_elevenlabs(audio_bytes, filename, api_key):
+def transcribe_elevenlabs(raw_bytes, filename, api_key):
+    ext  = os.path.splitext(filename)[1].lower()
+    mime = {"wav":"audio/wav","mp3":"audio/mpeg","m4a":"audio/mp4","ogg":"audio/ogg"}.get(ext, "audio/wav")
     headers = {"xi-api-key": api_key}
-    files   = {"audio": (filename, io.BytesIO(audio_bytes), "audio/wav")}
+    files   = {"audio": (filename, io.BytesIO(raw_bytes), mime)}
     data    = {"model_id": "scribe_v1", "language_code": "el"}
     resp = requests.post(ELEVENLABS_STT_URL, headers=headers, files=files, data=data, timeout=600)
     resp.raise_for_status()
     return resp.json().get("text", "")
 
-def transcribe_groq_chunks(audio, api_key, prog):
+def transcribe_groq_chunks(raw_bytes, filename, api_key, prog):
     client = Groq(api_key=api_key)
-    chunks = split_audio(audio)
+    chunks = split_bytes_into_chunks(raw_bytes, filename)
     n, parts = len(chunks), []
     for i, chunk in enumerate(chunks):
-        prog.progress(int(i/n*100), text=f"⚡ Groq — chunk {i+1}/{n}…")
-        mp3 = safe_mp3(chunk)
-        r = client.audio.transcriptions.create(file=(f"c{i}.mp3", mp3), model="whisper-large-v3", language="el", response_format="text")
+        prog.progress(int(i/n*100), text=f"⚡ Groq Whisper — chunk {i+1}/{n}…")
+        buf = io.BytesIO(chunk); buf.name = f"chunk_{i}.mp3"
+        r = client.audio.transcriptions.create(file=buf, model="whisper-large-v3", language="el", response_format="text")
         parts.append(r.strip())
         time.sleep(0.2)
-    prog.progress(100, text="Groq done ✅")
+    prog.progress(100, text="Groq Whisper done ✅")
     return " ".join(parts)
 
-def transcribe_openai_chunks(audio, api_key, prog):
-    client = openai.OpenAI(api_key=api_key)
-    chunks = split_audio(audio)
-    n, parts = len(chunks), []
-    for i, chunk in enumerate(chunks):
-        prog.progress(int(i/n*100), text=f"🟡 OpenAI — chunk {i+1}/{n}…")
-        mp3 = safe_mp3(chunk)
-        buf = io.BytesIO(mp3); buf.name = f"c{i}.mp3"
-        r = client.audio.transcriptions.create(model="whisper-1", file=buf, language="el", response_format="text")
-        parts.append(r.strip())
-        time.sleep(0.3)
-    prog.progress(100, text="OpenAI done ✅")
-    return " ".join(parts)
-
-# ── LLM cleanup ────────────────────────────────────────────────────────────────
+# ── LLM Cleanup ────────────────────────────────────────────────────────────────
 
 def _build_system(context):
     s = CLEANUP_SYSTEM
@@ -151,26 +172,28 @@ def _split_words(text, size=3000):
 
 def llm_cleanup_groq(text, api_key, context=""):
     client = Groq(api_key=api_key)
-    sys = _build_system(context)
+    sys_prompt = _build_system(context)
     parts = []
     for chunk in _split_words(text):
         r = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
-            messages=[{"role":"system","content":sys},{"role":"user","content":f"Διόρθωσε:\n\n{chunk}"}],
+            messages=[{"role":"system","content":sys_prompt},
+                      {"role":"user","content":f"Διόρθωσε:\n\n{chunk}"}],
             max_tokens=4096, temperature=0.2)
         parts.append(r.choices[0].message.content.strip())
     return "\n\n".join(parts)
 
-def llm_cleanup_openai(text, api_key, context=""):
-    client = openai.OpenAI(api_key=api_key)
-    sys = _build_system(context)
+def llm_cleanup_claude(text, api_key, context=""):
+    client = anthropic.Anthropic(api_key=api_key)
+    sys_prompt = _build_system(context)
     parts = []
     for chunk in _split_words(text):
-        r = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role":"system","content":sys},{"role":"user","content":f"Διόρθωσε:\n\n{chunk}"}],
-            max_tokens=4096, temperature=0.2)
-        parts.append(r.choices[0].message.content.strip())
+        r = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=4096,
+            system=sys_prompt,
+            messages=[{"role":"user","content":f"Διόρθωσε:\n\n{chunk}"}])
+        parts.append(r.content[0].text.strip())
     return "\n\n".join(parts)
 
 # ── SRT ────────────────────────────────────────────────────────────────────────
@@ -197,26 +220,27 @@ uploaded = st.file_uploader("Drop your audio file here", type=["wav","mp3","m4a"
 
 if uploaded:
     raw_bytes = uploaded.read()
-    c1,c2,c3 = st.columns(3)
+    c1, c2, c3 = st.columns(3)
     c1.metric("File size", f"{len(raw_bytes)/1024/1024:.1f} MB")
     with st.spinner("Reading audio…"):
-        audio = AudioSegment.from_file(io.BytesIO(raw_bytes))
-    c2.metric("Duration", format_duration(len(audio)))
-    c3.metric("Sample rate", f"{audio.frame_rate} Hz")
+        duration, samplerate = get_audio_info(raw_bytes, uploaded.name)
+    c2.metric("Duration", format_duration(duration))
+    c3.metric("Sample rate", f"{samplerate} Hz")
     st.markdown("---")
 
     if st.button("▶ Start Transcription", use_container_width=True):
 
-        if not el_key and not groq_key and not oai_key:
-            st.error("Προσθέστε τουλάχιστον ένα API key στο sidebar.")
+        if not el_key and not groq_key:
+            st.error("Προσθέστε ElevenLabs ή Groq API key για μεταγραφή.")
             st.stop()
 
         raw_transcript = ""
         method_used = ""
 
+        # 1. ElevenLabs
         if el_key and not raw_transcript:
             try:
-                st.info("🔵 ElevenLabs Scribe…")
+                st.info("🔵 ElevenLabs Scribe (full file)…")
                 prog = st.progress(0, text="Uploading…")
                 raw_transcript = transcribe_elevenlabs(raw_bytes, uploaded.name, el_key)
                 method_used = "ElevenLabs Scribe v1"
@@ -224,83 +248,77 @@ if uploaded:
             except Exception as e:
                 st.warning(f"ElevenLabs failed: {e}")
 
+        # 2. Groq Whisper
         if groq_key and not raw_transcript:
             try:
-                n = max(1, len(audio)//CHUNK_DURATION_MS+1)
-                st.info(f"⚡ Groq Whisper ({n} chunks)…")
+                st.info("⚡ Groq Whisper large-v3…")
                 prog = st.progress(0)
-                raw_transcript = transcribe_groq_chunks(audio, groq_key, prog)
-                method_used = f"Groq Whisper large-v3 ({n} chunk{'s' if n>1 else ''})"
+                raw_transcript = transcribe_groq_chunks(raw_bytes, uploaded.name, groq_key, prog)
+                method_used = "Groq Whisper large-v3"
             except Exception as e:
-                st.warning(f"Groq failed: {e}")
-
-        if oai_key and not raw_transcript:
-            try:
-                n = max(1, len(audio)//CHUNK_DURATION_MS+1)
-                st.info(f"🟡 OpenAI Whisper ({n} chunks)…")
-                prog = st.progress(0)
-                raw_transcript = transcribe_openai_chunks(audio, oai_key, prog)
-                method_used = f"OpenAI Whisper-1 ({n} chunk{'s' if n>1 else ''})"
-            except Exception as e:
-                st.error(f"Όλα απέτυχαν: {e}")
+                st.error(f"Groq Whisper failed: {e}")
                 st.stop()
 
         if not raw_transcript:
             st.error("Δεν επιστράφηκε μεταγραφή.")
             st.stop()
 
-        # ── 2nd pass ──────────────────────────────────────────────────────────
+        # 2nd pass LLM cleanup
         cleaned_transcript = None
-
         if do_cleanup:
-            use_groq = "Groq" in cleanup_engine
-            key_for_cleanup = groq_key if use_groq else oai_key
+            use_groq_cleanup   = "Groq" in cleanup_engine
+            use_claude_cleanup = "Claude" in cleanup_engine
+            key_for_cleanup    = groq_key if use_groq_cleanup else claude_key
+
             if not key_for_cleanup:
-                st.warning("⚠️ Δεν υπάρχει key για LLM cleanup — παρακάμπτεται.")
+                missing = "Groq" if use_groq_cleanup else "Anthropic Claude"
+                st.warning(f"⚠️ Δεν υπάρχει {missing} key — παρακάμπτεται το cleanup.")
             else:
                 try:
-                    engine_name = "Groq llama-3.3-70b" if use_groq else "GPT-4o"
-                    st.info(f"🧹 2ο Πέρασμα με {engine_name}…")
+                    engine_label = "Groq llama-3.3-70b" if use_groq_cleanup else "Claude Haiku"
+                    st.info(f"🧹 2ο Πέρασμα με {engine_label}…")
                     prog2 = st.progress(0, text="Επεξεργασία…")
-                    if use_groq:
+                    if use_groq_cleanup:
                         cleaned_transcript = llm_cleanup_groq(raw_transcript, groq_key, custom_context)
                     else:
-                        cleaned_transcript = llm_cleanup_openai(raw_transcript, oai_key, custom_context)
+                        cleaned_transcript = llm_cleanup_claude(raw_transcript, claude_key, custom_context)
                     prog2.progress(100, text="Διόρθωση ολοκληρώθηκε ✅")
                 except Exception as e:
                     st.warning(f"LLM cleanup απέτυχε: {e}")
 
-        # ── Results ────────────────────────────────────────────────────────────
         label = method_used + (" + LLM διόρθωση" if cleaned_transcript else "")
         st.success(f"✅ {label}")
 
         final = cleaned_transcript or raw_transcript
-        cc1,cc2 = st.columns(2)
+        cc1, cc2 = st.columns(2)
         cc1.metric("Λέξεις", f"{len(final.split()):,}")
         cc2.metric("Χαρακτήρες", f"{len(final):,}")
 
         if cleaned_transcript:
             tab1, tab2 = st.tabs(["✅ Διορθωμένο", "📄 Αρχικό (raw)"])
             with tab1:
-                st.text_area(" ", cleaned_transcript, height=420, label_visibility="collapsed", key="t1")
+                st.text_area("Διορθωμένο", cleaned_transcript, height=420, label_visibility="collapsed", key="t1")
             with tab2:
-                st.text_area(" ", raw_transcript, height=420, label_visibility="collapsed", key="t2")
+                st.text_area("Αρχικό", raw_transcript, height=420, label_visibility="collapsed", key="t2")
         else:
-            st.text_area(" ", raw_transcript, height=420, label_visibility="collapsed", key="t0")
+            st.text_area("Transcript", raw_transcript, height=420, label_visibility="collapsed", key="t0")
 
         base = os.path.splitext(uploaded.name)[0]
         st.markdown("### 💾 Download")
-        d1,d2,d3 = st.columns(3)
+        d1, d2, d3 = st.columns(3)
         with d1:
-            st.download_button("⬇ Διορθωμένο .TXT", data=final.encode("utf-8"), file_name=f"{base}_transcript.txt", mime="text/plain", use_container_width=True)
+            st.download_button("⬇ Διορθωμένο .TXT", data=final.encode("utf-8"),
+                file_name=f"{base}_transcript.txt", mime="text/plain", use_container_width=True)
         with d2:
-            st.download_button("⬇ Αρχικό .TXT", data=raw_transcript.encode("utf-8"), file_name=f"{base}_raw.txt", mime="text/plain", use_container_width=True)
+            st.download_button("⬇ Αρχικό .TXT", data=raw_transcript.encode("utf-8"),
+                file_name=f"{base}_raw.txt", mime="text/plain", use_container_width=True)
         with d3:
-            st.download_button("⬇ .SRT", data=make_srt(final).encode("utf-8"), file_name=f"{base}.srt", mime="text/plain", use_container_width=True)
+            st.download_button("⬇ .SRT", data=make_srt(final).encode("utf-8"),
+                file_name=f"{base}.srt", mime="text/plain", use_container_width=True)
 
 else:
     st.markdown("""
-    <div style='text-align:center;padding:3rem 0;color:#333;'>
+    <div style='text-align:center;padding:3rem 0;'>
         <div style='font-size:4rem'>🎙️</div>
         <div style='font-family:"IBM Plex Mono",monospace;font-size:0.9rem;margin-top:1rem;color:#555;'>
             Waiting for audio file…<br>WAV · MP3 · M4A · OGG
