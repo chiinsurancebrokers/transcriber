@@ -64,12 +64,12 @@ with st.sidebar:
     st.markdown("## 🧹 2ο Πέρασμα LLM")
     do_cleanup = st.checkbox("Αυτόματη διόρθωση κειμένου", value=True)
 
-    cleanup_engine = "Claude Sonnet 🤖"
+    cleanup_engine = "Claude Haiku 🤖"
     custom_context = ""
     if do_cleanup:
         cleanup_engine = st.radio(
             "Engine διόρθωσης",
-            ["Claude Sonnet 🤖 (καλύτερο, συνιστάται)", "Groq llama-3.3-70b ⚡ (γρήγορο)", "OpenAI GPT-4o ✨ (αν έχεις key)"],
+            ["Claude Haiku 🤖 (γρήγορο + καλό)", "Groq llama-3.3-70b ⚡ (γρήγορο)", "OpenAI GPT-4o ✨ (αν έχεις key)"],
         )
         custom_context = st.text_area(
             "Ειδικοί όροι (προαιρετικό)",
@@ -310,7 +310,7 @@ if uploaded:
                     if use_oai_c:
                         cleaned_transcript = llm_cleanup_openai(raw_transcript, oai_key, custom_context)
                     elif use_claude_c:
-                        cleaned_transcript = llm_cleanup_claude(raw_transcript, claude_key, custom_context)
+                        cleaned_transcript = llm_cleanup_claude(raw_transcript, claude_key, custom_context, prog2)
                     else:
                         cleaned_transcript = llm_cleanup_groq(raw_transcript, groq_key, custom_context)
                     prog2.progress(100, text="Διόρθωση ολοκληρώθηκε ✅")
