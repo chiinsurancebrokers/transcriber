@@ -1,4 +1,5 @@
 import streamlit as st
+import openai
 import anthropic
 import requests
 import os
@@ -32,9 +33,7 @@ hr { border-color: #2a2d38 !important; }
 </style>
 """, unsafe_allow_html=True)
 
-ELEVENLABS_STT_URL = "https://api.elevenlabs.io/v1/speech-to-text"
-CHUNK_DURATION_S   = 10 * 60
-MAX_BYTES          = 24 * 1024 * 1024
+CHUNK_DURATION_S = 10 * 60
 
 CLEANUP_SYSTEM = """Είσαι ειδικός διορθωτής ελληνικών κειμένων.
 Σου δίνεται αυτόματη μεταγραφή από ελληνικό ηχητικό αρχείο.
@@ -48,20 +47,29 @@ CLEANUP_SYSTEM = """Είσαι ειδικός διορθωτής ελληνικ�
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 🔑 API Keys")
-    el_key      = st.text_input("ElevenLabs API Key",  value=st.secrets.get("ELEVENLABS_API_KEY", ""),  type="password", placeholder="xi-…")
-    groq_key    = st.text_input("Groq API Key ⚡",      value=st.secrets.get("GROQ_API_KEY", ""),        type="password", placeholder="gsk_…")
-    claude_key  = st.text_input("Anthropic (Claude) Key 🤖", value=st.secrets.get("ANTHROPIC_API_KEY", ""), type="password", placeholder="sk-ant-…")
+    st.caption("Χρησιμοποίησε personal keys (όχι project keys)")
+
+    groq_key   = st.text_input("Groq API Key ⚡",            value=st.secrets.get("GROQ_API_KEY", ""),        type="password", placeholder="gsk_…")
+    oai_key    = st.text_input("OpenAI API Key",              value=st.secrets.get("OPENAI_API_KEY", ""),      type="password", placeholder="sk-… (όχι sk-proj-)")
+    claude_key = st.text_input("Anthropic (Claude) Key 🤖",  value=st.secrets.get("ANTHROPIC_API_KEY", ""),   type="password", placeholder="sk-ant-…")
+
+    st.markdown("---")
+    st.markdown("## 🎙️ Μεταγραφή")
+    transcribe_engine = st.radio(
+        "Engine μεταγραφής",
+        ["Groq Whisper ⚡ (γρήγορο)", "OpenAI Whisper (καλύτερη ποιότητα)"],
+    )
 
     st.markdown("---")
     st.markdown("## 🧹 2ο Πέρασμα LLM")
     do_cleanup = st.checkbox("Αυτόματη διόρθωση κειμένου", value=True)
 
-    cleanup_engine = "Groq llama-3.3-70b ⚡"
+    cleanup_engine = "Claude Sonnet 🤖"
     custom_context = ""
     if do_cleanup:
         cleanup_engine = st.radio(
             "Engine διόρθωσης",
-            ["Groq llama-3.3-70b ⚡ (γρήγορο)", "Claude Haiku 🤖 (ακριβέστερο)"],
+            ["Claude Sonnet 🤖 (καλύτερο, συνιστάται)", "Groq llama-3.3-70b ⚡ (γρήγορο)", "OpenAI GPT-4o ✨ (αν έχεις key)"],
         )
         custom_context = st.text_area(
             "Ειδικοί όροι (προαιρετικό)",
@@ -71,9 +79,10 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown(
-        "<small style='color:#555;font-family:\"IBM Plex Mono\",monospace;'>"
-        "Transcription: ElevenLabs → Groq Whisper<br>"
-        "Cleanup: Groq llama / Claude</small>",
+        "<small style='color:#444;font-family:\"IBM Plex Mono\",monospace;'>"
+        "⚠️ OpenAI: χρειάζεσαι personal key<br>"
+        "(platform.openai.com → API keys)<br>"
+        "όχι project key (sk-proj-...)</small>",
         unsafe_allow_html=True,
     )
 
@@ -121,8 +130,9 @@ def split_bytes_into_chunks(raw_bytes, filename, chunk_s=CHUNK_DURATION_S):
         for i in range(n):
             with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as tmp_out:
                 tmp_out_path = tmp_out.name
-            subprocess.run(['ffmpeg', '-y', '-ss', str(i*chunk_s), '-t', str(chunk_s),
-                '-i', tmp_in_path, '-q:a', '5', '-map', 'a', tmp_out_path],
+            subprocess.run(
+                ['ffmpeg', '-y', '-ss', str(i*chunk_s), '-t', str(chunk_s),
+                 '-i', tmp_in_path, '-q:a', '5', '-map', 'a', tmp_out_path],
                 capture_output=True, timeout=120)
             with open(tmp_out_path, 'rb') as f:
                 data = f.read()
@@ -135,16 +145,6 @@ def split_bytes_into_chunks(raw_bytes, filename, chunk_s=CHUNK_DURATION_S):
 
 # ── Transcription ──────────────────────────────────────────────────────────────
 
-def transcribe_elevenlabs(raw_bytes, filename, api_key):
-    ext  = os.path.splitext(filename)[1].lower()
-    mime = {"wav":"audio/wav","mp3":"audio/mpeg","m4a":"audio/mp4","ogg":"audio/ogg"}.get(ext, "audio/wav")
-    headers = {"xi-api-key": api_key}
-    files   = {"audio": (filename, io.BytesIO(raw_bytes), mime)}
-    data    = {"model_id": "scribe_v1", "language_code": "el"}
-    resp = requests.post(ELEVENLABS_STT_URL, headers=headers, files=files, data=data, timeout=600)
-    resp.raise_for_status()
-    return resp.json().get("text", "")
-
 def transcribe_groq_chunks(raw_bytes, filename, api_key, prog):
     client = Groq(api_key=api_key)
     chunks = split_bytes_into_chunks(raw_bytes, filename)
@@ -152,32 +152,44 @@ def transcribe_groq_chunks(raw_bytes, filename, api_key, prog):
     for i, chunk in enumerate(chunks):
         prog.progress(int(i/n*100), text=f"⚡ Groq Whisper — chunk {i+1}/{n}…")
         buf = io.BytesIO(chunk); buf.name = f"chunk_{i}.mp3"
-        r = client.audio.transcriptions.create(file=buf, model="whisper-large-v3", language="el", response_format="text")
+        r = client.audio.transcriptions.create(
+            file=buf, model="whisper-large-v3", language="el", response_format="text")
         parts.append(r.strip())
         time.sleep(0.2)
     prog.progress(100, text="Groq Whisper done ✅")
     return " ".join(parts)
 
+def transcribe_openai_chunks(raw_bytes, filename, api_key, prog):
+    client = openai.OpenAI(api_key=api_key)
+    chunks = split_bytes_into_chunks(raw_bytes, filename)
+    n, parts = len(chunks), []
+    for i, chunk in enumerate(chunks):
+        prog.progress(int(i/n*100), text=f"🟡 OpenAI Whisper — chunk {i+1}/{n}…")
+        buf = io.BytesIO(chunk); buf.name = f"chunk_{i}.mp3"
+        r = client.audio.transcriptions.create(
+            model="whisper-1", file=buf, language="el", response_format="text")
+        parts.append(r.strip())
+        time.sleep(0.3)
+    prog.progress(100, text="OpenAI Whisper done ✅")
+    return " ".join(parts)
+
 # ── LLM Cleanup ────────────────────────────────────────────────────────────────
 
 def _build_system(context):
-    s = CLEANUP_SYSTEM
-    if context:
-        s += f"\n\nΕιδικοί όροι:\n{context}"
-    return s
+    return CLEANUP_SYSTEM + (f"\n\nΕιδικοί όροι:\n{context}" if context else "")
 
-def _split_words(text, size=3000):
+def _split_words(text, size=2000):
     words = text.split()
     return [" ".join(words[i:i+size]) for i in range(0, len(words), size)]
 
-def llm_cleanup_groq(text, api_key, context=""):
-    client = Groq(api_key=api_key)
-    sys_prompt = _build_system(context)
-    parts = []
+def llm_cleanup_openai(text, api_key, context=""):
+    client = openai.OpenAI(api_key=api_key)
+    sys_p  = _build_system(context)
+    parts  = []
     for chunk in _split_words(text):
         r = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role":"system","content":sys_prompt},
+            model="gpt-4o",
+            messages=[{"role":"system","content":sys_p},
                       {"role":"user","content":f"Διόρθωσε:\n\n{chunk}"}],
             max_tokens=4096, temperature=0.2)
         parts.append(r.choices[0].message.content.strip())
@@ -185,30 +197,45 @@ def llm_cleanup_groq(text, api_key, context=""):
 
 def llm_cleanup_claude(text, api_key, context=""):
     client = anthropic.Anthropic(api_key=api_key)
-    sys_prompt = _build_system(context)
-    parts = []
+    sys_p  = _build_system(context)
+    parts  = []
     for chunk in _split_words(text):
         r = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=4096,
-            system=sys_prompt,
+            model="claude-sonnet-4-6",
+            max_tokens=4096, system=sys_p,
             messages=[{"role":"user","content":f"Διόρθωσε:\n\n{chunk}"}])
         parts.append(r.content[0].text.strip())
+    return "\n\n".join(parts)
+
+def llm_cleanup_groq(text, api_key, context=""):
+    client = Groq(api_key=api_key)
+    sys_p  = _build_system(context)
+    parts  = []
+    chunks = _split_words(text, size=1200)
+    for i, chunk in enumerate(chunks):
+        r = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role":"system","content":sys_p},
+                      {"role":"user","content":f"Διόρθωσε:\n\n{chunk}"}],
+            max_tokens=2048, temperature=0.2)
+        parts.append(r.choices[0].message.content.strip())
+        if i < len(chunks)-1:
+            time.sleep(5)
     return "\n\n".join(parts)
 
 # ── SRT ────────────────────────────────────────────────────────────────────────
 
 def _ts(s):
-    h,r=divmod(s,3600); m,sc=divmod(r,60)
+    h, r = divmod(s, 3600); m, sc = divmod(r, 60)
     return f"{h:02d}:{m:02d}:{sc:02d},000"
 
 def make_srt(text):
-    words=text.split(); lines,block,t=[],[],0
-    for i,w in enumerate(words):
+    words = text.split(); lines, block, t = [], [], 0
+    for i, w in enumerate(words):
         block.append(w)
-        if len(block)>=20 or i==len(words)-1:
+        if len(block) >= 20 or i == len(words)-1:
             lines.append(f"{len(lines)+1}\n{_ts(t)} --> {_ts(t+10)}\n{' '.join(block)}\n")
-            block,t=[],t+10
+            block, t = [], t+10
     return "\n".join(lines)
 
 # ── Main UI ────────────────────────────────────────────────────────────────────
@@ -230,34 +257,34 @@ if uploaded:
 
     if st.button("▶ Start Transcription", use_container_width=True):
 
-        if not el_key and not groq_key:
-            st.error("Προσθέστε ElevenLabs ή Groq API key για μεταγραφή.")
+        use_groq_asr   = "Groq" in transcribe_engine
+        use_openai_asr = "OpenAI" in transcribe_engine
+
+        if use_groq_asr and not groq_key:
+            st.error("Προσθέστε Groq API key.")
+            st.stop()
+        if use_openai_asr and not oai_key:
+            st.error("Προσθέστε OpenAI API key (personal, όχι project key).")
             st.stop()
 
         raw_transcript = ""
-        method_used = ""
+        method_used    = ""
 
-        # 1. ElevenLabs
-        if el_key and not raw_transcript:
-            try:
-                st.info("🔵 ElevenLabs Scribe (full file)…")
-                prog = st.progress(0, text="Uploading…")
-                raw_transcript = transcribe_elevenlabs(raw_bytes, uploaded.name, el_key)
-                method_used = "ElevenLabs Scribe v1"
-                prog.progress(100, text="✅")
-            except Exception as e:
-                st.warning(f"ElevenLabs failed: {e}")
-
-        # 2. Groq Whisper
-        if groq_key and not raw_transcript:
-            try:
+        # Transcription
+        try:
+            if use_groq_asr:
                 st.info("⚡ Groq Whisper large-v3…")
                 prog = st.progress(0)
                 raw_transcript = transcribe_groq_chunks(raw_bytes, uploaded.name, groq_key, prog)
                 method_used = "Groq Whisper large-v3"
-            except Exception as e:
-                st.error(f"Groq Whisper failed: {e}")
-                st.stop()
+            else:
+                st.info("🟡 OpenAI Whisper-1…")
+                prog = st.progress(0)
+                raw_transcript = transcribe_openai_chunks(raw_bytes, uploaded.name, oai_key, prog)
+                method_used = "OpenAI Whisper-1"
+        except Exception as e:
+            st.error(f"Μεταγραφή απέτυχε: {e}")
+            st.stop()
 
         if not raw_transcript:
             st.error("Δεν επιστράφηκε μεταγραφή.")
@@ -266,22 +293,26 @@ if uploaded:
         # 2nd pass LLM cleanup
         cleaned_transcript = None
         if do_cleanup:
-            use_groq_cleanup   = "Groq" in cleanup_engine
-            use_claude_cleanup = "Claude" in cleanup_engine
-            key_for_cleanup    = groq_key if use_groq_cleanup else claude_key
+            use_oai_c    = "GPT" in cleanup_engine
+            use_claude_c = "Claude" in cleanup_engine
+            use_groq_c   = "Groq" in cleanup_engine
 
-            if not key_for_cleanup:
-                missing = "Groq" if use_groq_cleanup else "Anthropic Claude"
-                st.warning(f"⚠️ Δεν υπάρχει {missing} key — παρακάμπτεται το cleanup.")
+            key_map = {"oai": oai_key, "claude": claude_key, "groq": groq_key}
+            key_c   = oai_key if use_oai_c else (claude_key if use_claude_c else groq_key)
+            label_c = "GPT-4o" if use_oai_c else ("Claude Sonnet" if use_claude_c else "Groq llama")
+
+            if not key_c:
+                st.warning(f"⚠️ Δεν υπάρχει {label_c} key — παρακάμπτεται.")
             else:
                 try:
-                    engine_label = "Groq llama-3.3-70b" if use_groq_cleanup else "Claude Haiku"
-                    st.info(f"🧹 2ο Πέρασμα με {engine_label}…")
+                    st.info(f"🧹 2ο Πέρασμα με {label_c}…")
                     prog2 = st.progress(0, text="Επεξεργασία…")
-                    if use_groq_cleanup:
-                        cleaned_transcript = llm_cleanup_groq(raw_transcript, groq_key, custom_context)
-                    else:
+                    if use_oai_c:
+                        cleaned_transcript = llm_cleanup_openai(raw_transcript, oai_key, custom_context)
+                    elif use_claude_c:
                         cleaned_transcript = llm_cleanup_claude(raw_transcript, claude_key, custom_context)
+                    else:
+                        cleaned_transcript = llm_cleanup_groq(raw_transcript, groq_key, custom_context)
                     prog2.progress(100, text="Διόρθωση ολοκληρώθηκε ✅")
                 except Exception as e:
                     st.warning(f"LLM cleanup απέτυχε: {e}")
@@ -291,7 +322,7 @@ if uploaded:
 
         final = cleaned_transcript or raw_transcript
         cc1, cc2 = st.columns(2)
-        cc1.metric("Λέξεις", f"{len(final.split()):,}")
+        cc1.metric("Λέξεις",     f"{len(final.split()):,}")
         cc2.metric("Χαρακτήρες", f"{len(final):,}")
 
         if cleaned_transcript:
